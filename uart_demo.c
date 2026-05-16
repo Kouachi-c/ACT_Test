@@ -6,10 +6,16 @@
  * Configures a serial port, sends a test message, then listens for incoming
  * data using a select()-based timeout so the process never blocks indefinitely.
  *
+ * Usage:
+ *   ./uart_demo [device]   — open a real serial port (e.g. /dev/ttyUSB0)
+ *   ./uart_demo -l         — loopback mode: virtual PTY pair, no hardware needed
+ *
  */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <pty.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,12 +25,12 @@
 
 /*  Compile-time configuration  */
 
-#define DEFAULT_DEVICE    "/dev/ttyS0"  /* fallback when no argv[1] given   */
-#define BAUD_RATE         B115200       /* termios baud constant            */
-#define DATA_BITS         8             /* character width: 5, 6, 7, or 8   */
-#define PARITY            0             /* 0 = none, 1 = odd, 2 = even      */
-#define STOP_BITS         1             /* 1 or 2                           */
-#define READ_TIMEOUT_SEC  5             /* how long to wait for RX data      */
+#define DEFAULT_DEVICE    "/dev/ttyUSB0" /* typical USB-serial adapter        */
+#define BAUD_RATE         B115200        /* termios baud constant             */
+#define DATA_BITS         8              /* character width: 5, 6, 7, or 8   */
+#define PARITY            0              /* 0 = none, 1 = odd, 2 = even      */
+#define STOP_BITS         1              /* 1 or 2                            */
+#define READ_TIMEOUT_SEC  5              /* how long to wait for RX data      */
 #define RX_BUF_SIZE       256
 #define TEST_MESSAGE      "Hello from UART Demo!\r\n"
 
@@ -39,16 +45,54 @@ typedef struct {
     struct termios saved;   /* snapshot of termios before we touched it    */
 } uart_ctx_t;
 
+/*  Loopback echo thread  */
+
+typedef struct {
+    int          master_fd;
+    _Atomic int  stop;
+} echo_args_t;
+
 /*  Forward declarations  */
 
-static int  uart_open   (uart_ctx_t *ctx, const char *dev);
-static int  uart_config (uart_ctx_t *ctx, speed_t baud,
-                         int data_bits, int parity, int stop_bits);
-static int  uart_write  (uart_ctx_t *ctx, const char *buf, size_t len);
-static int  uart_read   (uart_ctx_t *ctx, char *buf, size_t max, int timeout_sec);
-static void uart_close  (uart_ctx_t *ctx);
+static int  uart_open          (uart_ctx_t *ctx, const char *dev);
+static int  uart_open_loopback (uart_ctx_t *ctx, int *master_out);
+static int  uart_config        (uart_ctx_t *ctx, speed_t baud,
+                                int data_bits, int parity, int stop_bits);
+static int  uart_write         (uart_ctx_t *ctx, const char *buf, size_t len);
+static int  uart_read          (uart_ctx_t *ctx, char *buf, size_t max,
+                                int timeout_sec);
+static void uart_close         (uart_ctx_t *ctx);
+static void *echo_loop         (void *arg);
 
-/* 
+/* -------------------------------------------------------------------------
+ * echo_loop
+ *
+ * Runs in a background thread during loopback mode.  Reads whatever the
+ * UART write path sends to the PTY master and writes it straight back, so
+ * the slave side sees its own transmission — a perfect loopback.
+ * ------------------------------------------------------------------------- */
+static void *echo_loop(void *arg)
+{
+    echo_args_t   *a = arg;
+    char           buf[RX_BUF_SIZE];
+    struct timeval tv;
+    fd_set         rfds;
+
+    while (!a->stop) {
+        FD_ZERO(&rfds);
+        FD_SET(a->master_fd, &rfds);
+        tv = (struct timeval){ .tv_sec = 0, .tv_usec = 50000 }; /* 50 ms poll */
+
+        if (select(a->master_fd + 1, &rfds, NULL, NULL, &tv) > 0) {
+            ssize_t n = read(a->master_fd, buf, sizeof buf);
+            if (n > 0 && write(a->master_fd, buf, n) < 0)
+                break; /* slave was closed — stop echoing */
+        }
+    }
+    return NULL;
+}
+
+/* -------------------------------------------------------------------------
  * uart_open
  *
  * Opens the serial device and saves its current termios settings so they
@@ -61,22 +105,36 @@ static void uart_close  (uart_ctx_t *ctx);
  *   O_NDELAY  — don't block waiting for DCD (carrier detect)
  *
  * Returns 0 on success, -1 on error.
- */
+ * ------------------------------------------------------------------------- */
 static int uart_open(uart_ctx_t *ctx, const char *dev)
 {
     ctx->fd = open(dev, O_RDWR | O_NOCTTY | O_NDELAY);
     if (ctx->fd < 0) {
-        /*
-         * Common causes: wrong path, insufficient permissions, device not
-         * present.  strerror() gives the exact OS reason.
-         */
-        fprintf(stderr, "[uart] open(\"%s\"): %s\n", dev, strerror(errno));
+        if (errno == EACCES)
+            fprintf(stderr,
+                "[uart] open(\"%s\"): permission denied.\n"
+                "       Fix: sudo usermod -aG dialout $USER && newgrp dialout\n",
+                dev);
+        else if (errno == ENOENT)
+            fprintf(stderr,
+                "[uart] open(\"%s\"): device not found.\n"
+                "       Fix: plug in a USB-serial adapter or run with -l for loopback.\n",
+                dev);
+        else
+            fprintf(stderr, "[uart] open(\"%s\"): %s\n", dev, strerror(errno));
         return -1;
     }
 
     /* Snapshot current settings — restored verbatim in uart_close(). */
     if (tcgetattr(ctx->fd, &ctx->saved) != 0) {
-        fprintf(stderr, "[uart] tcgetattr: %s\n", strerror(errno));
+        if (errno == EIO)
+            fprintf(stderr,
+                "[uart] tcgetattr: no UART hardware at \"%s\" (EIO).\n"
+                "       The device node exists but no physical port is present.\n"
+                "       Fix: use /dev/ttyUSB0 (USB-serial adapter) or run with -l.\n",
+                dev);
+        else
+            fprintf(stderr, "[uart] tcgetattr: %s\n", strerror(errno));
         close(ctx->fd);
         ctx->fd = -1;
         return -1;
@@ -98,7 +156,40 @@ static int uart_open(uart_ctx_t *ctx, const char *dev)
     return 0;
 }
 
-/* 
+/* -------------------------------------------------------------------------
+ * uart_open_loopback
+ *
+ * Creates a pseudo-terminal pair (master + slave).  The slave is used as
+ * the UART fd in ctx; the caller runs echo_loop() on master so every byte
+ * written to the slave comes back to it — no real hardware required.
+ *
+ * Returns 0 on success, -1 on error.  *master_out is set on success and
+ * must be closed by the caller after the echo thread has been stopped.
+ * ------------------------------------------------------------------------- */
+static int uart_open_loopback(uart_ctx_t *ctx, int *master_out)
+{
+    int master, slave;
+
+    if (openpty(&master, &slave, NULL, NULL, NULL) != 0) {
+        fprintf(stderr, "[uart] openpty: %s\n", strerror(errno));
+        return -1;
+    }
+
+    ctx->fd = slave;
+
+    if (tcgetattr(slave, &ctx->saved) != 0) {
+        fprintf(stderr, "[uart] tcgetattr (loopback): %s\n", strerror(errno));
+        close(master);
+        close(slave);
+        ctx->fd = -1;
+        return -1;
+    }
+
+    *master_out = master;
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * uart_config
  *
  * Applies baud rate, data-bits, parity, and stop-bits to the open port.
@@ -109,7 +200,7 @@ static int uart_open(uart_ctx_t *ctx, const char *dev)
  * on top, but done field-by-field so each choice is explicit.
  *
  * Returns 0 on success, -1 on error.
- */
+ * ------------------------------------------------------------------------- */
 static int uart_config(uart_ctx_t *ctx, speed_t baud,
                        int data_bits, int parity, int stop_bits)
 {
@@ -191,7 +282,7 @@ static int uart_config(uart_ctx_t *ctx, speed_t baud,
     return 0;
 }
 
-/*  
+/* -------------------------------------------------------------------------
  * uart_write
  *
  * Transmits exactly len bytes from buf, retrying on short writes (which can
@@ -199,7 +290,7 @@ static int uart_config(uart_ctx_t *ctx, speed_t baud,
  * tcdrain() blocks until the hardware FIFO has shifted out all bytes.
  *
  * Returns the total bytes written, or -1 on a hard error.
- */
+ * ------------------------------------------------------------------------- */
 static int uart_write(uart_ctx_t *ctx, const char *buf, size_t len)
 {
     size_t sent = 0;
@@ -223,7 +314,7 @@ static int uart_write(uart_ctx_t *ctx, const char *buf, size_t len)
     return (int)sent;
 }
 
-/* 
+/* -------------------------------------------------------------------------
  * uart_read
  *
  * Waits up to timeout_sec seconds for data to arrive, then reads up to
@@ -236,7 +327,7 @@ static int uart_write(uart_ctx_t *ctx, const char *buf, size_t len)
  *   >0  bytes received (buf is NUL-terminated)
  *    0  timeout — no data within timeout_sec
  *   -1  error
- */
+ * ------------------------------------------------------------------------- */
 static int uart_read(uart_ctx_t *ctx, char *buf, size_t max, int timeout_sec)
 {
     fd_set rfds;
@@ -266,12 +357,12 @@ static int uart_read(uart_ctx_t *ctx, char *buf, size_t max, int timeout_sec)
     return (int)n;
 }
 
-/* 
+/* -------------------------------------------------------------------------
  * uart_close
  *
  * Restores the port's original termios settings and closes the file
  * descriptor.  Safe to call even if uart_open() failed (fd == -1).
- */
+ * ------------------------------------------------------------------------- */
 static void uart_close(uart_ctx_t *ctx)
 {
     if (ctx->fd < 0) return;
@@ -288,21 +379,40 @@ static void uart_close(uart_ctx_t *ctx)
     ctx->fd = -1;
 }
 
-/* =========================
+/* ==========================================================================
  * main
- * =========================
- */
+ * ========================================================================== */
 int main(int argc, char *argv[])
 {
-    const char *device = (argc > 1) ? argv[1] : DEFAULT_DEVICE;
+    int         loopback = (argc > 1 && strcmp(argv[1], "-l") == 0);
+    const char *device   = loopback          ? "loopback (virtual PTY)"
+                         : (argc > 1)        ? argv[1]
+                         :                     DEFAULT_DEVICE;
+
     uart_ctx_t  ctx    = { .fd = -1 };
     char        rx_buf[RX_BUF_SIZE];
-    int         rc;
+    int         master_fd = -1;
+    int         rc = 0;
 
     /*  Open  */
     printf("[uart] Opening device : %s\n", device);
-    if (uart_open(&ctx, device) != 0)
-        return EXIT_FAILURE;
+
+    if (loopback) {
+        if (uart_open_loopback(&ctx, &master_fd) != 0)
+            return EXIT_FAILURE;
+    } else {
+        if (uart_open(&ctx, device) != 0)
+            return EXIT_FAILURE;
+    }
+
+    /*  Start echo thread in loopback mode  */
+    pthread_t   echo_tid;
+    echo_args_t echo_args = { .master_fd = master_fd, .stop = 0 };
+
+    if (loopback) {
+        printf("[uart] Loopback mode  : echo thread active\n");
+        pthread_create(&echo_tid, NULL, echo_loop, &echo_args);
+    }
 
     /*  Configure  */
     printf("[uart] Config         : 115200 baud | %d data bits | %s parity | %d stop bit(s)\n",
@@ -310,36 +420,37 @@ int main(int argc, char *argv[])
            PARITY == 0 ? "none" : PARITY == 1 ? "odd" : "even",
            STOP_BITS);
 
-    if (uart_config(&ctx, BAUD_RATE, DATA_BITS, PARITY, STOP_BITS) != 0) {
-        uart_close(&ctx);
-        return EXIT_FAILURE;
-    }
+    if (uart_config(&ctx, BAUD_RATE, DATA_BITS, PARITY, STOP_BITS) != 0)
+        goto cleanup;
 
     /*  Transmit  */
     printf("[uart] TX → \"%.*s\"\n",
            (int)(strlen(TEST_MESSAGE) - 2), TEST_MESSAGE); /* strip trailing \r\n */
 
     rc = uart_write(&ctx, TEST_MESSAGE, strlen(TEST_MESSAGE));
-    if (rc < 0) {
-        uart_close(&ctx);
-        return EXIT_FAILURE;
-    }
+    if (rc < 0) goto cleanup;
     printf("[uart] Sent %d byte(s).\n", rc);
 
     /*  Receive  */
     printf("[uart] Waiting up to %d s for incoming data…\n", READ_TIMEOUT_SEC);
     rc = uart_read(&ctx, rx_buf, sizeof rx_buf, READ_TIMEOUT_SEC);
 
-    if (rc > 0) {
-        printf("[uart] RX (%d byte(s)) → \"%s\"\n", rc, rx_buf);
-    } else if (rc < 0) {
-        uart_close(&ctx);
-        return EXIT_FAILURE;
-    }
-    /* rc == 0 means timeout; uart_read() already printed a message         */
+    if (rc > 0)
+        printf("[uart] RX (%d byte(s)) → \"%.*s\"\n",
+               rc, rc - 1, rx_buf); /* strip trailing \r\n for display */
+    else if (rc < 0)
+        goto cleanup;
+    /* rc == 0 means timeout; uart_read() already printed a message */
 
-    /*  Cleanup  */
+cleanup:
     uart_close(&ctx);
+
+    if (loopback) {
+        echo_args.stop = 1;
+        pthread_join(echo_tid, NULL);
+        close(master_fd);
+    }
+
     printf("[uart] Done.\n");
-    return EXIT_SUCCESS;
+    return (rc < 0) ? EXIT_FAILURE : EXIT_SUCCESS;
 }

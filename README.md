@@ -28,7 +28,7 @@ timeout.
 ## Build
 
 ```bash
-make
+make clean && make
 ```
 
 Or manually:
